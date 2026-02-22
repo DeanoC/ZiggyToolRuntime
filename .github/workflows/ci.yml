@@ -8,26 +8,8 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Verify module package metadata
-        run: |
-          grep -q '\.name = \.ziggy_tool_runtime' build.zig.zon
-          grep -q '\.version = ' build.zig.zon
-
-      - name: Install Zig
-        run: |
-          ZIG_VERSION=0.15.1
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
-          tar -xf zig.tar.xz
-          export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
-          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
-          zig version
-
-      - name: Build
-        run: zig build
-
-      - name: Test
-        run: zig build test
+    uses: DeanoC/ZiggySpiderweb/.github/workflows/ziggy-shared-ci.yml@main
+    with:
+      verify_script: |
+        grep -q '\.name = \.ziggy_tool_runtime' build.zig.zon
+        grep -q '\.version = ' build.zig.zon
