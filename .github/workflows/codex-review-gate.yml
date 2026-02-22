@@ -52,8 +52,6 @@ jobs:
               return Number.isNaN(parsed.getTime()) ? new Date(0) : parsed;
             };
 
-            const isAtOrAfter = (value, threshold) => parseDate(value).getTime() >= threshold.getTime();
-
             const isCodexReviewer = (login) => {
               if (!login) return false;
               const normalized = login.toLowerCase();
@@ -65,18 +63,11 @@ jobs:
 
             const pull = (await github.rest.pulls.get({ owner, repo, pull_number: prNumber })).data;
             const prAuthor = pull.user?.login;
-            const headSha = pull.head?.sha;
 
-            if (!prAuthor || !headSha) {
-              core.setFailed('Unable to determine PR author or head SHA.');
+            if (!prAuthor) {
+              core.setFailed('Unable to determine PR author.');
               return;
             }
-
-            const headCommit = await github.rest.repos.getCommit({ owner, repo, ref: headSha });
-            const headTimestamp = parseDate(
-              headCommit.data.commit.committer?.date ??
-              headCommit.data.commit.author?.date
-            );
 
             const issueComments = await github.paginate(github.rest.issues.listComments, {
               owner,
@@ -89,24 +80,7 @@ jobs:
               return comment.user?.login === prAuthor && isCodexReviewRequest(comment.body);
             });
 
-            if (reviewRequests.length === 0) {
-              core.setFailed(`Missing "@codex review" comment from PR author (${prAuthor}).`);
-              return;
-            }
-
-            const latestReviewRequest = [...reviewRequests].sort((a, b) => {
-              return parseDate(a.created_at) - parseDate(b.created_at);
-            })[reviewRequests.length - 1];
-
-            const latestReviewRequestAt = parseDate(latestReviewRequest.created_at);
-
-            if (latestReviewRequestAt.getTime() < headTimestamp.getTime()) {
-              core.setFailed(
-                `Latest "@codex review" request predates HEAD (${headSha.slice(0, 7)}). ` +
-                'Add a fresh "@codex review" comment after your latest push.'
-              );
-              return;
-            }
+            const codexIssueComments = issueComments.filter((comment) => isCodexReviewer(comment.user?.login));
 
             const reviews = await github.paginate(github.rest.pulls.listReviews, {
               owner,
@@ -120,31 +94,14 @@ jobs:
               return review.state && review.state !== 'PENDING' && review.state !== 'DISMISSED';
             });
 
-            const relevantCodexReviews = codexReviews.filter((review) => {
-              return isAtOrAfter(review.submitted_at, latestReviewRequestAt) &&
-                isAtOrAfter(review.submitted_at, headTimestamp);
-            });
+            const codexResponses = [
+              ...codexReviews.map((review) => ({ type: 'review', at: parseDate(review.submitted_at), state: review.state })),
+              ...codexIssueComments.map((comment) => ({ type: 'comment', at: parseDate(comment.created_at), state: null })),
+            ].sort((a, b) => a.at - b.at);
 
-            const codexIssueResponses = issueComments.filter((comment) => {
-              if (!isCodexReviewer(comment.user?.login)) return false;
-              return isAtOrAfter(comment.created_at, latestReviewRequestAt) &&
-                isAtOrAfter(comment.created_at, headTimestamp);
-            });
-
-            if (relevantCodexReviews.length === 0 && codexIssueResponses.length === 0) {
-              core.setFailed('Missing codex response after latest "@codex review" request.');
+            if (codexResponses.length === 0) {
+              core.setFailed('Missing codex response for initial automatic review cycle.');
               return;
-            }
-
-            if (relevantCodexReviews.length > 0) {
-              const latestCodexReview = [...relevantCodexReviews].sort((a, b) => {
-                return parseDate(a.submitted_at) - parseDate(b.submitted_at);
-              })[relevantCodexReviews.length - 1];
-
-              if (latestCodexReview.state === 'CHANGES_REQUESTED') {
-                core.setFailed('Latest codex review after request is CHANGES_REQUESTED.');
-                return;
-              }
             }
 
             const unresolvedThreads = [];
@@ -199,8 +156,66 @@ jobs:
             }
 
             if (unresolvedThreads.length > 0) {
-              core.setFailed(`Found ${unresolvedThreads.length} unresolved review thread(s) from codex.`);
+              core.notice(
+                `Codex escape clause active for PR #${prNumber}: ${unresolvedThreads.length} unresolved codex thread(s). Manual merge is allowed and auto-merge will stay disabled.`,
+              );
               return;
+            }
+
+            const firstCodexResponseAt = codexResponses[0].at;
+            const latestCodexResponseAt = codexResponses[codexResponses.length - 1].at;
+            const tenMinutesMs = 10 * 60 * 1000;
+            const codexResponseAgeMs = Date.now() - latestCodexResponseAt.getTime();
+
+            if (codexResponseAgeMs > tenMinutesMs) {
+              core.notice(
+                `Codex escape clause active for PR #${prNumber}: latest codex response is older than 10 minutes. Manual merge is allowed and auto-merge will stay disabled.`,
+              );
+              return;
+            }
+
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner,
+              repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            const latestCommitAt = commits.reduce((latest, commit) => {
+              const commitAt = parseDate(commit.commit?.committer?.date ?? commit.commit?.author?.date);
+              return commitAt.getTime() > latest.getTime() ? commitAt : latest;
+            }, parseDate(pull.created_at));
+
+            const hasSubsequentCycle = latestCommitAt.getTime() > firstCodexResponseAt.getTime();
+
+            const latestReviewRequest = [...reviewRequests]
+              .sort((a, b) => parseDate(a.created_at) - parseDate(b.created_at))
+              .pop();
+            const latestReviewRequestAt = latestReviewRequest ? parseDate(latestReviewRequest.created_at) : null;
+
+            if (hasSubsequentCycle) {
+              if (!latestReviewRequestAt || latestReviewRequestAt.getTime() < latestCommitAt.getTime()) {
+                core.setFailed('Missing "@codex review" comment after latest push. The first review cycle is automatic; subsequent cycles require an explicit request.');
+                return;
+              }
+            }
+
+            if (latestReviewRequestAt && latestCodexResponseAt.getTime() < latestReviewRequestAt.getTime()) {
+              core.setFailed('Missing codex response after latest "@codex review" request.');
+              return;
+            }
+
+            const relevantStart = latestReviewRequestAt ?? firstCodexResponseAt;
+            const relevantCodexReviews = codexReviews.filter((review) => parseDate(review.submitted_at).getTime() >= relevantStart.getTime());
+
+            if (relevantCodexReviews.length > 0) {
+              const latestCodexReview = relevantCodexReviews
+                .sort((a, b) => parseDate(a.submitted_at) - parseDate(b.submitted_at))
+                .pop();
+              if (latestCodexReview.state === 'CHANGES_REQUESTED') {
+                core.setFailed('Latest codex review requests changes.');
+                return;
+              }
             }
 
             core.notice(`Codex review gate passed for PR #${prNumber}.`);
