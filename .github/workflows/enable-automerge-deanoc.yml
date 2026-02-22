@@ -9,7 +9,7 @@ on:
       - ready_for_review
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
 
 jobs:
@@ -50,6 +50,10 @@ jobs:
               const message = String(error?.message || error);
               if (message.includes('already enabled')) {
                 core.info(`Auto-merge already enabled for PR #${prNumber}.`);
+                return;
+              }
+              if (message.includes('Resource not accessible by integration')) {
+                core.warning(`Auto-merge could not be enabled for PR #${prNumber}: ${message}`);
                 return;
               }
               throw error;

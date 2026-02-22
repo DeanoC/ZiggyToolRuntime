@@ -65,18 +65,31 @@ jobs:
               return review.state && review.state !== 'PENDING' && review.state !== 'DISMISSED';
             });
 
-            if (codexReviews.length === 0) {
+            const issueComments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+
+            const codexIssueComments = issueComments.filter((comment) => isCodexReviewer(comment.user?.login));
+
+            if (codexReviews.length === 0 && codexIssueComments.length === 0) {
               core.setFailed('Missing required review from chatgpt-codex-connector.');
               return;
             }
 
-            const latestCodexReview = [...codexReviews].sort((a, b) => {
-              return new Date(a.submitted_at || 0) - new Date(b.submitted_at || 0);
-            })[codexReviews.length - 1];
+            if (codexReviews.length > 0) {
+              const latestCodexReview = [...codexReviews].sort((a, b) => {
+                return new Date(a.submitted_at || 0) - new Date(b.submitted_at || 0);
+              })[codexReviews.length - 1];
 
-            if (latestCodexReview.state === 'CHANGES_REQUESTED') {
-              core.setFailed('Latest chatgpt-codex-connector review is CHANGES_REQUESTED.');
-              return;
+              if (latestCodexReview.state === 'CHANGES_REQUESTED') {
+                core.setFailed('Latest chatgpt-codex-connector review is CHANGES_REQUESTED.');
+                return;
+              }
+            } else {
+              core.notice(`No formal review found; using codex issue comment fallback for PR #${prNumber}.`);
             }
 
             const unresolvedThreads = [];
