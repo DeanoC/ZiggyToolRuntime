@@ -187,6 +187,59 @@ fn appendJsonEscaped(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(
     }
 }
 
+fn buildFileReadPayload(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    bytes: usize,
+    truncated: bool,
+    content: []const u8,
+    ready: bool,
+    wait_until_ready: bool,
+) ![]u8 {
+    var payload = std.ArrayListUnmanaged(u8){};
+    errdefer payload.deinit(allocator);
+
+    try payload.appendSlice(allocator, "{\"path\":\"");
+    try appendJsonEscaped(allocator, &payload, path);
+    try payload.appendSlice(allocator, "\",\"bytes\":");
+    try payload.writer(allocator).print("{d}", .{bytes});
+    try payload.appendSlice(allocator, ",\"truncated\":");
+    try payload.appendSlice(allocator, if (truncated) "true" else "false");
+    try payload.appendSlice(allocator, ",\"content\":\"");
+    try appendJsonEscaped(allocator, &payload, content);
+    try payload.appendSlice(allocator, "\",\"ready\":");
+    try payload.appendSlice(allocator, if (ready) "true" else "false");
+    try payload.appendSlice(allocator, ",\"wait_until_ready\":");
+    try payload.appendSlice(allocator, if (wait_until_ready) "true" else "false");
+    try payload.append(allocator, '}');
+    return payload.toOwnedSlice(allocator);
+}
+
+fn buildFileWritePayload(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    bytes_written: usize,
+    append: bool,
+    ready: bool,
+    wait_until_ready: bool,
+) ![]u8 {
+    var payload = std.ArrayListUnmanaged(u8){};
+    errdefer payload.deinit(allocator);
+
+    try payload.appendSlice(allocator, "{\"path\":\"");
+    try appendJsonEscaped(allocator, &payload, path);
+    try payload.appendSlice(allocator, "\",\"bytes_written\":");
+    try payload.writer(allocator).print("{d}", .{bytes_written});
+    try payload.appendSlice(allocator, ",\"append\":");
+    try payload.appendSlice(allocator, if (append) "true" else "false");
+    try payload.appendSlice(allocator, ",\"ready\":");
+    try payload.appendSlice(allocator, if (ready) "true" else "false");
+    try payload.appendSlice(allocator, ",\"wait_until_ready\":");
+    try payload.appendSlice(allocator, if (wait_until_ready) "true" else "false");
+    try payload.append(allocator, '}');
+    return payload.toOwnedSlice(allocator);
+}
+
 fn utf8SafePrefix(value: []const u8) []const u8 {
     if (std.unicode.utf8ValidateSlice(value)) return value;
     return value[0..longestValidUtf8PrefixLen(value)];
@@ -202,6 +255,13 @@ fn longestValidUtf8PrefixLen(value: []const u8) usize {
         i = next;
     }
     return i;
+}
+
+fn isWouldBlockError(err: anyerror) bool {
+    return switch (err) {
+        error.WouldBlock => true,
+        else => false,
+    };
 }
 
 fn shellQuoteSingle(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -228,6 +288,7 @@ pub const BuiltinTools = struct {
             &[_]registry_mod.ToolParam{
                 .{ .name = "path", .param_type = .string, .description = "Path to file", .required = true },
                 .{ .name = "max_bytes", .param_type = .integer, .description = "Maximum bytes to read", .required = false },
+                .{ .name = "wait_until_ready", .param_type = .boolean, .description = "Block until endpoint is ready (default true)", .required = false },
             },
             fileRead,
         );
@@ -239,6 +300,7 @@ pub const BuiltinTools = struct {
                 .{ .name = "content", .param_type = .string, .description = "File content", .required = true },
                 .{ .name = "append", .param_type = .boolean, .description = "Append instead of overwrite", .required = false },
                 .{ .name = "create_parents", .param_type = .boolean, .description = "Create parent folders", .required = false },
+                .{ .name = "wait_until_ready", .param_type = .boolean, .description = "Block until endpoint is ready (default true)", .required = false },
             },
             fileWrite,
         );
@@ -286,6 +348,9 @@ pub const BuiltinTools = struct {
         const max_bytes = parseUsize(args, "max_bytes", DEFAULT_MAX_FILE_READ_BYTES) catch {
             return fail(allocator, .invalid_params, "max_bytes must be a non-negative integer");
         };
+        const wait_until_ready = parseBool(args, "wait_until_ready", true) catch {
+            return fail(allocator, .invalid_params, "wait_until_ready must be boolean");
+        };
         const effective_max = @min(max_bytes, 8 * 1024 * 1024);
 
         const workspace_real = getWorkspaceRootRealpath(allocator) catch |err| return fail(allocator, .execution_failed, @errorName(err));
@@ -293,8 +358,36 @@ pub const BuiltinTools = struct {
         const absolute_path = resolveAbsolutePathInWorkspace(allocator, workspace_real, path) catch return fail(allocator, .execution_failed, "out of memory");
         defer allocator.free(absolute_path);
 
-        var file = std.fs.openFileAbsolute(absolute_path, .{}) catch |err| {
-            return fail(allocator, .execution_failed, @errorName(err));
+        var file: std.fs.File = blk: {
+            if (wait_until_ready) {
+                break :blk std.fs.openFileAbsolute(absolute_path, .{}) catch |err| {
+                    return fail(allocator, .execution_failed, @errorName(err));
+                };
+            }
+
+            const fd = std.posix.open(
+                absolute_path,
+                .{
+                    .ACCMODE = .RDONLY,
+                    .NONBLOCK = true,
+                    .CLOEXEC = true,
+                },
+                0,
+            ) catch |err| {
+                if (isWouldBlockError(err)) {
+                    return .{ .success = .{ .payload_json = buildFileReadPayload(
+                        allocator,
+                        path,
+                        0,
+                        false,
+                        "",
+                        false,
+                        false,
+                    ) catch return fail(allocator, .execution_failed, "out of memory") } };
+                }
+                return fail(allocator, .execution_failed, @errorName(err));
+            };
+            break :blk .{ .handle = fd };
         };
         defer file.close();
 
@@ -302,27 +395,37 @@ pub const BuiltinTools = struct {
 
         const content_buffer = allocator.alloc(u8, effective_max) catch return fail(allocator, .execution_failed, "out of memory");
         defer allocator.free(content_buffer);
-        const content_len = file.readAll(content_buffer) catch |err| {
-            return fail(allocator, .execution_failed, @errorName(err));
-        };
+        const content_len = if (wait_until_ready)
+            file.readAll(content_buffer) catch |err| {
+                return fail(allocator, .execution_failed, @errorName(err));
+            }
+        else
+            file.read(content_buffer) catch |err| {
+                if (isWouldBlockError(err)) {
+                    return .{ .success = .{ .payload_json = buildFileReadPayload(
+                        allocator,
+                        path,
+                        0,
+                        false,
+                        "",
+                        false,
+                        false,
+                    ) catch return fail(allocator, .execution_failed, "out of memory") } };
+                }
+                return fail(allocator, .execution_failed, @errorName(err));
+            };
         const raw_content = content_buffer[0..content_len];
         const truncated = file_size > content_len;
         const content = if (truncated) utf8SafePrefix(raw_content) else raw_content;
-
-        var payload = std.ArrayListUnmanaged(u8){};
-        errdefer payload.deinit(allocator);
-
-        payload.appendSlice(allocator, "{\"path\":\"") catch return fail(allocator, .execution_failed, "out of memory");
-        appendJsonEscaped(allocator, &payload, path) catch return fail(allocator, .execution_failed, "out of memory");
-        payload.appendSlice(allocator, "\",\"bytes\":") catch return fail(allocator, .execution_failed, "out of memory");
-        payload.writer(allocator).print("{d}", .{content.len}) catch return fail(allocator, .execution_failed, "out of memory");
-        payload.appendSlice(allocator, ",\"truncated\":") catch return fail(allocator, .execution_failed, "out of memory");
-        payload.appendSlice(allocator, if (truncated) "true" else "false") catch return fail(allocator, .execution_failed, "out of memory");
-        payload.appendSlice(allocator, ",\"content\":\"") catch return fail(allocator, .execution_failed, "out of memory");
-        appendJsonEscaped(allocator, &payload, content) catch return fail(allocator, .execution_failed, "out of memory");
-        payload.appendSlice(allocator, "\"}") catch return fail(allocator, .execution_failed, "out of memory");
-
-        return .{ .success = .{ .payload_json = payload.toOwnedSlice(allocator) catch return fail(allocator, .execution_failed, "out of memory") } };
+        return .{ .success = .{ .payload_json = buildFileReadPayload(
+            allocator,
+            path,
+            content.len,
+            truncated,
+            content,
+            true,
+            wait_until_ready,
+        ) catch return fail(allocator, .execution_failed, "out of memory") } };
     }
 
     pub fn fileWrite(allocator: std.mem.Allocator, args: std.json.ObjectMap) registry_mod.ToolExecutionResult {
@@ -336,6 +439,7 @@ pub const BuiltinTools = struct {
 
         const append = parseBool(args, "append", false) catch return fail(allocator, .invalid_params, "append must be boolean");
         const create_parents = parseBool(args, "create_parents", true) catch return fail(allocator, .invalid_params, "create_parents must be boolean");
+        const wait_until_ready = parseBool(args, "wait_until_ready", true) catch return fail(allocator, .invalid_params, "wait_until_ready must be boolean");
 
         const workspace_real = getWorkspaceRootRealpath(allocator) catch |err| return fail(allocator, .execution_failed, @errorName(err));
         defer allocator.free(workspace_real);
@@ -346,28 +450,70 @@ pub const BuiltinTools = struct {
             ensureAbsoluteParentDir(absolute_path) catch |err| return fail(allocator, .execution_failed, @errorName(err));
         }
 
-        if (append) {
-            var file = std.fs.createFileAbsolute(absolute_path, .{ .truncate = false }) catch |err| return fail(allocator, .execution_failed, @errorName(err));
-            defer file.close();
-            file.seekFromEnd(0) catch |err| return fail(allocator, .execution_failed, @errorName(err));
-            file.writeAll(content) catch |err| return fail(allocator, .execution_failed, @errorName(err));
+        var bytes_written: usize = 0;
+        var ready = true;
+        if (wait_until_ready) {
+            if (append) {
+                var file = std.fs.createFileAbsolute(absolute_path, .{ .truncate = false }) catch |err| return fail(allocator, .execution_failed, @errorName(err));
+                defer file.close();
+                file.seekFromEnd(0) catch |err| return fail(allocator, .execution_failed, @errorName(err));
+                file.writeAll(content) catch |err| return fail(allocator, .execution_failed, @errorName(err));
+            } else {
+                var file = std.fs.createFileAbsolute(absolute_path, .{ .truncate = true }) catch |err| return fail(allocator, .execution_failed, @errorName(err));
+                defer file.close();
+                file.writeAll(content) catch |err| return fail(allocator, .execution_failed, @errorName(err));
+            }
+            bytes_written = content.len;
         } else {
-            var file = std.fs.createFileAbsolute(absolute_path, .{ .truncate = true }) catch |err| return fail(allocator, .execution_failed, @errorName(err));
+            const fd = std.posix.open(
+                absolute_path,
+                .{
+                    .ACCMODE = .WRONLY,
+                    .CREAT = true,
+                    .TRUNC = !append,
+                    .APPEND = append,
+                    .NONBLOCK = true,
+                    .CLOEXEC = true,
+                },
+                0o644,
+            ) catch |err| {
+                if (isWouldBlockError(err)) {
+                    return .{ .success = .{ .payload_json = buildFileWritePayload(
+                        allocator,
+                        path,
+                        0,
+                        append,
+                        false,
+                        false,
+                    ) catch return fail(allocator, .execution_failed, "out of memory") } };
+                }
+                return fail(allocator, .execution_failed, @errorName(err));
+            };
+            var file = std.fs.File{ .handle = fd };
             defer file.close();
-            file.writeAll(content) catch |err| return fail(allocator, .execution_failed, @errorName(err));
+            while (bytes_written < content.len) {
+                const written_now = file.write(content[bytes_written..]) catch |err| {
+                    if (isWouldBlockError(err)) {
+                        ready = false;
+                        break;
+                    }
+                    return fail(allocator, .execution_failed, @errorName(err));
+                };
+                if (written_now == 0) {
+                    ready = false;
+                    break;
+                }
+                bytes_written += written_now;
+            }
         }
-
-        var payload = std.ArrayListUnmanaged(u8){};
-        errdefer payload.deinit(allocator);
-        payload.appendSlice(allocator, "{\"path\":\"") catch return fail(allocator, .execution_failed, "out of memory");
-        appendJsonEscaped(allocator, &payload, path) catch return fail(allocator, .execution_failed, "out of memory");
-        payload.appendSlice(allocator, "\",\"bytes_written\":") catch return fail(allocator, .execution_failed, "out of memory");
-        payload.writer(allocator).print("{d}", .{content.len}) catch return fail(allocator, .execution_failed, "out of memory");
-        payload.appendSlice(allocator, ",\"append\":") catch return fail(allocator, .execution_failed, "out of memory");
-        payload.appendSlice(allocator, if (append) "true" else "false") catch return fail(allocator, .execution_failed, "out of memory");
-        payload.append(allocator, '}') catch return fail(allocator, .execution_failed, "out of memory");
-
-        return .{ .success = .{ .payload_json = payload.toOwnedSlice(allocator) catch return fail(allocator, .execution_failed, "out of memory") } };
+        return .{ .success = .{ .payload_json = buildFileWritePayload(
+            allocator,
+            path,
+            bytes_written,
+            append,
+            ready,
+            wait_until_ready,
+        ) catch return fail(allocator, .execution_failed, "out of memory") } };
     }
 
     pub fn fileList(allocator: std.mem.Allocator, args: std.json.ObjectMap) registry_mod.ToolExecutionResult {
@@ -685,6 +831,7 @@ fn testFileWriteReadImpl(allocator: std.mem.Allocator, _: []const u8) !void {
 
     try std.testing.expect(read_result == .success);
     try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"content\":\"hello\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"ready\":true") != null);
 }
 
 test "tool_executor: file_write then file_read roundtrip" {
@@ -731,6 +878,42 @@ fn testFileReadMaxBytesUtf8BoundaryImpl(allocator: std.mem.Allocator, _: []const
 
 test "tool_executor: file_read max_bytes keeps truncated output utf8-safe" {
     try inTempCwd(std.testing.allocator, testFileReadMaxBytesUtf8BoundaryImpl);
+}
+
+fn testFileReadNonBlockingFlagImpl(allocator: std.mem.Allocator, _: []const u8) !void {
+    try std.fs.cwd().writeFile(.{ .sub_path = "ready.txt", .data = "ready" });
+
+    var read_parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"path\":\"ready.txt\",\"wait_until_ready\":false}", .{});
+    defer read_parsed.deinit();
+
+    var read_result = BuiltinTools.fileRead(allocator, read_parsed.value.object);
+    defer read_result.deinit(allocator);
+
+    try std.testing.expect(read_result == .success);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"wait_until_ready\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"ready\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"content\":\"ready\"") != null);
+}
+
+test "tool_executor: file_read supports wait_until_ready=false" {
+    try inTempCwd(std.testing.allocator, testFileReadNonBlockingFlagImpl);
+}
+
+fn testFileWriteNonBlockingFlagImpl(allocator: std.mem.Allocator, _: []const u8) !void {
+    var write_parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"path\":\"nb.txt\",\"content\":\"x\",\"wait_until_ready\":false}", .{});
+    defer write_parsed.deinit();
+
+    var write_result = BuiltinTools.fileWrite(allocator, write_parsed.value.object);
+    defer write_result.deinit(allocator);
+
+    try std.testing.expect(write_result == .success);
+    try std.testing.expect(std.mem.indexOf(u8, write_result.success.payload_json, "\"wait_until_ready\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_result.success.payload_json, "\"ready\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_result.success.payload_json, "\"bytes_written\":1") != null);
+}
+
+test "tool_executor: file_write supports wait_until_ready=false" {
+    try inTempCwd(std.testing.allocator, testFileWriteNonBlockingFlagImpl);
 }
 
 fn testFileListImpl(allocator: std.mem.Allocator, _: []const u8) !void {
