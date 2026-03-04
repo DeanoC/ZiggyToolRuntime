@@ -79,6 +79,7 @@ fn maybeExecuteRemote(
 }
 
 fn isWithinWorkspace(workspace: []const u8, target: []const u8) bool {
+    if (std.mem.eql(u8, workspace, "/")) return std.fs.path.isAbsolute(target);
     if (std.mem.eql(u8, workspace, target)) return true;
     if (!std.mem.startsWith(u8, target, workspace)) return false;
     if (target.len <= workspace.len) return false;
@@ -107,12 +108,15 @@ fn getWorkspaceRootRealpath(allocator: std.mem.Allocator) ![]u8 {
 fn resolveAbsolutePathInWorkspace(
     allocator: std.mem.Allocator,
     workspace_real: []const u8,
-    relative_path: []const u8,
+    path: []const u8,
 ) ![]u8 {
-    if (std.mem.eql(u8, relative_path, ".")) {
+    if (std.fs.path.isAbsolute(path)) {
+        return allocator.dupe(u8, path);
+    }
+    if (std.mem.eql(u8, path, ".")) {
         return allocator.dupe(u8, workspace_real);
     }
-    return std.fs.path.join(allocator, &.{ workspace_real, relative_path });
+    return std.fs.path.join(allocator, &.{ workspace_real, path });
 }
 
 fn ensureAbsoluteParentDir(path: []const u8) !void {
@@ -130,7 +134,6 @@ fn ensureAbsoluteParentDir(path: []const u8) !void {
 
 fn validatePathOwned(allocator: std.mem.Allocator, path: []const u8, mode: PathMode) ?[]u8 {
     if (path.len == 0) return allocator.dupe(u8, "path cannot be empty") catch null;
-    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, "absolute paths are not allowed") catch null;
     if (path[0] == '~') return allocator.dupe(u8, "home directory references are not allowed") catch null;
 
     const workspace_real = getWorkspaceRootRealpath(allocator) catch |err| {
@@ -138,7 +141,7 @@ fn validatePathOwned(allocator: std.mem.Allocator, path: []const u8, mode: PathM
     };
     defer allocator.free(workspace_real);
 
-    var candidate = switch (mode) {
+    var candidate: []const u8 = switch (mode) {
         .read_or_list => path,
         .write => std.fs.path.dirname(path) orelse ".",
     };
@@ -880,6 +883,26 @@ test "tool_executor: file_read max_bytes keeps truncated output utf8-safe" {
     try inTempCwd(std.testing.allocator, testFileReadMaxBytesUtf8BoundaryImpl);
 }
 
+fn testFileReadAbsolutePathImpl(allocator: std.mem.Allocator, target_cwd: []const u8) !void {
+    try std.fs.cwd().writeFile(.{ .sub_path = "abs.txt", .data = "absolute-read" });
+    const absolute_path = try std.fmt.allocPrint(allocator, "{s}/abs.txt", .{target_cwd});
+    defer allocator.free(absolute_path);
+    const request_json = try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\"}}", .{absolute_path});
+    defer allocator.free(request_json);
+
+    var read_parsed = try std.json.parseFromSlice(std.json.Value, allocator, request_json, .{});
+    defer read_parsed.deinit();
+
+    var read_result = BuiltinTools.fileRead(allocator, read_parsed.value.object);
+    defer read_result.deinit(allocator);
+    try std.testing.expect(read_result == .success);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"content\":\"absolute-read\"") != null);
+}
+
+test "tool_executor: file_read supports absolute path within workspace" {
+    try inTempCwd(std.testing.allocator, testFileReadAbsolutePathImpl);
+}
+
 fn testFileReadNonBlockingFlagImpl(allocator: std.mem.Allocator, _: []const u8) !void {
     try std.fs.cwd().writeFile(.{ .sub_path = "ready.txt", .data = "ready" });
 
@@ -933,6 +956,27 @@ fn testFileListImpl(allocator: std.mem.Allocator, _: []const u8) !void {
 
 test "tool_executor: file_list honors max_entries truncation" {
     try inTempCwd(std.testing.allocator, testFileListImpl);
+}
+
+fn testFileListAbsolutePathImpl(allocator: std.mem.Allocator, target_cwd: []const u8) !void {
+    try std.fs.cwd().makePath("abs-list");
+    try std.fs.cwd().writeFile(.{ .sub_path = "abs-list/entry.txt", .data = "entry" });
+    const absolute_path = try std.fmt.allocPrint(allocator, "{s}/abs-list", .{target_cwd});
+    defer allocator.free(absolute_path);
+    const request_json = try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"max_entries\":20}}", .{absolute_path});
+    defer allocator.free(request_json);
+
+    var list_parsed = try std.json.parseFromSlice(std.json.Value, allocator, request_json, .{});
+    defer list_parsed.deinit();
+
+    var list_result = BuiltinTools.fileList(allocator, list_parsed.value.object);
+    defer list_result.deinit(allocator);
+    try std.testing.expect(list_result == .success);
+    try std.testing.expect(std.mem.indexOf(u8, list_result.success.payload_json, "\"entry.txt\"") != null);
+}
+
+test "tool_executor: file_list supports absolute path within workspace" {
+    try inTempCwd(std.testing.allocator, testFileListAbsolutePathImpl);
 }
 
 fn testSearchCodeImpl(allocator: std.mem.Allocator, _: []const u8) !void {
